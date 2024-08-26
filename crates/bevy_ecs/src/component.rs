@@ -14,7 +14,6 @@ use bevy_ptr::{OwningPtr, UnsafeCellDeref};
 #[cfg(feature = "bevy_reflect")]
 use bevy_reflect::Reflect;
 use bevy_utils::TypeIdMap;
-use std::cell::UnsafeCell;
 use std::{
     alloc::Layout,
     any::{Any, TypeId},
@@ -22,6 +21,7 @@ use std::{
     marker::PhantomData,
     mem::needs_drop,
 };
+use std::{cell::UnsafeCell, ptr::NonNull};
 
 /// A data type that can be used to store data for an [entity].
 ///
@@ -406,7 +406,7 @@ impl ComponentHooks {
 #[derive(Debug, Clone)]
 pub struct ComponentInfo {
     id: ComponentId,
-    descriptor: ComponentDescriptor,
+    pub(crate) descriptor: ComponentDescriptor,
     hooks: ComponentHooks,
 }
 
@@ -726,7 +726,19 @@ impl Components {
         storages: &mut Storages,
         descriptor: ComponentDescriptor,
     ) -> ComponentId {
-        Components::init_component_inner(&mut self.components, storages, descriptor)
+        if let Some(type_id) = descriptor.type_id() {
+            let Components {
+                indices,
+                components,
+                ..
+            } = self;
+            *indices.entry(type_id).or_insert_with(|| {
+                let index = Components::init_component_inner(components, storages, descriptor);
+                index
+            })
+        } else {
+            Components::init_component_inner(&mut self.components, storages, descriptor)
+        }
     }
 
     #[inline]
@@ -1131,5 +1143,44 @@ impl<T: Component> FromWorld for InitComponentId<T> {
             component_id: world.init_component::<T>(),
             marker: PhantomData,
         }
+    }
+}
+
+/// SAFETY: Dropping this type will only deallocate the memory inside the boxedcomponent, but will not call the drop impl of the component!!
+pub struct BoxedComponent {
+    descriptor: ComponentDescriptor,
+    ptr: NonNull<u8>,
+}
+
+impl BoxedComponent {
+    /// SAFETY:
+    ///  - Caller must guarantee that the component descriptor matches the one used to create `ptr`
+    pub(crate) unsafe fn from_desc_ptr(
+        descriptor: ComponentDescriptor,
+        ptr: OwningPtr<'_>,
+    ) -> Self {
+        let owned_ptr = std::alloc::alloc(descriptor.layout);
+        owned_ptr.copy_from(ptr.as_ptr(), descriptor.layout.size());
+        Self {
+            descriptor,
+            ptr: NonNull::new_unchecked(owned_ptr),
+        }
+    }
+
+    pub fn descriptor(&self) -> &ComponentDescriptor {
+        &self.descriptor
+    }
+}
+
+impl<'a> BoxedComponent {
+    pub fn to_ptr(&'a self) -> OwningPtr<'a> {
+        unsafe { OwningPtr::new(self.ptr.clone()) }
+    }
+}
+
+impl Drop for BoxedComponent {
+    fn drop(&mut self) {
+        // Safety: we allocated this with the exact same layout
+        unsafe { std::alloc::dealloc(self.ptr.as_mut(), self.descriptor.layout) }
     }
 }

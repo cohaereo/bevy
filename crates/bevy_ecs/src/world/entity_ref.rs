@@ -2,7 +2,7 @@ use crate::{
     archetype::{Archetype, ArchetypeId, Archetypes},
     bundle::{Bundle, BundleId, BundleInfo, BundleInserter, DynamicBundle, InsertMode},
     change_detection::MutUntyped,
-    component::{Component, ComponentId, ComponentTicks, Components, StorageType},
+    component::{BoxedComponent, Component, ComponentId, ComponentTicks, Components, StorageType},
     entity::{Entities, Entity, EntityLocation},
     event::Event,
     observer::{Observer, Observers},
@@ -975,6 +975,97 @@ impl<'w> EntityWorldMut<'w> {
                     old_location,
                 )
             })
+        };
+
+        #[allow(clippy::undocumented_unsafe_blocks)] // TODO: document why this is safe
+        unsafe {
+            Self::move_entity_from_remove::<false>(
+                entity,
+                &mut self.location,
+                old_location.archetype_id,
+                old_location,
+                entities,
+                archetypes,
+                storages,
+                new_archetype_id,
+            );
+        }
+        Some(result)
+    }
+
+    #[must_use]
+    pub unsafe fn take_by_id(&mut self, component_id: ComponentId) -> Option<BoxedComponent> {
+        let world = &mut self.world;
+        let storages = &mut world.storages;
+        let components = &mut world.components;
+        let bundle_id = world.bundles.init_component_info(components, component_id);
+        let bundle_info = unsafe { world.bundles.get_unchecked(bundle_id) };
+        let old_location = self.location;
+        // SAFETY: `archetype_id` exists because it is referenced in the old `EntityLocation` which is valid,
+        // components exist in `bundle_info` because `Bundles::init_info` initializes a `BundleInfo` containing all components of the bundle type `T`
+        let new_archetype_id = unsafe {
+            remove_bundle_from_archetype(
+                &mut world.archetypes,
+                storages,
+                components,
+                &world.observers,
+                old_location.archetype_id,
+                bundle_info,
+                false,
+            )?
+        };
+
+        if new_archetype_id == old_location.archetype_id {
+            return None;
+        }
+
+        let entity = self.entity;
+        // SAFETY: Archetypes and Bundles cannot be mutably aliased through DeferredWorld
+        let (old_archetype, bundle_info, mut deferred_world) = unsafe {
+            let bundle_info: *const BundleInfo = bundle_info;
+            let world = world.as_unsafe_world_cell();
+            (
+                &world.archetypes()[old_location.archetype_id],
+                &*bundle_info,
+                world.into_deferred(),
+            )
+        };
+
+        // SAFETY: all bundle components exist in World
+        unsafe {
+            trigger_on_replace_and_on_remove_hooks_and_observers(
+                &mut deferred_world,
+                old_archetype,
+                entity,
+                bundle_info,
+            );
+        }
+
+        let archetypes = &mut world.archetypes;
+        let storages = &mut world.storages;
+        let components = &mut world.components;
+        let entities = &mut world.entities;
+        let removed_components = &mut world.removed_components;
+
+        let component_info = components.get_info(component_id)?;
+
+        let entity = self.entity;
+        // SAFETY: bundle components are iterated in order, which guarantees that the component type
+        // matches
+        let result = unsafe {
+            // SAFETY:
+            // - uhhhh
+            BoxedComponent::from_desc_ptr(
+                component_info.descriptor.clone(),
+                take_component(
+                    storages,
+                    components,
+                    removed_components,
+                    component_id,
+                    entity,
+                    old_location,
+                ),
+            )
         };
 
         #[allow(clippy::undocumented_unsafe_blocks)] // TODO: document why this is safe
